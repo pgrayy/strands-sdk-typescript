@@ -3,6 +3,7 @@ import type { InvokeArgs, InvokeOptions, InvokableAgent } from '../types/agent.j
 import { takeSnapshot, loadSnapshot } from '../agent/snapshot.js'
 import type { MultiAgentStreamEvent } from './events.js'
 import { NodeStreamUpdateEvent, NodeResultEvent } from './events.js'
+import type { NodeInnerEvent } from './events.js'
 import { NodeResult, Status } from './state.js'
 import type { MultiAgentState, NodeResultUpdate } from './state.js'
 import type { MultiAgent } from './multiagent.js'
@@ -155,10 +156,17 @@ export class AgentNode extends Node {
         ...(state.structuredOutputSchema && { structuredOutputSchema: state.structuredOutputSchema }),
       }
 
+      const source = this._agent instanceof Agent ? ('agent' as const) : ('custom' as const)
+
       const gen = this._agent.stream(args, options)
       let next = await gen.next()
       while (!next.done) {
-        yield new NodeStreamUpdateEvent({ nodeId: this.id, nodeType: this.type, state, event: next.value })
+        yield new NodeStreamUpdateEvent({
+          nodeId: this.id,
+          nodeType: this.type,
+          state,
+          inner: Object.assign(next.value, { source }) as NodeInnerEvent,
+        })
         next = await gen.next()
       }
 
@@ -223,7 +231,12 @@ export class MultiAgentNode extends Node {
       if (event.type === 'nodeStreamUpdateEvent') {
         yield event
       } else {
-        yield new NodeStreamUpdateEvent({ nodeId: this.id, nodeType: this.type, state, event })
+        yield new NodeStreamUpdateEvent({
+          nodeId: this.id,
+          nodeType: this.type,
+          state,
+          inner: Object.assign(event, { source: 'multiAgent' as const }) as NodeInnerEvent,
+        })
       }
       next = await gen.next()
     }
