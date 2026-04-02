@@ -8,6 +8,9 @@
 // Agent class
 export { Agent } from './agent/agent.js'
 
+// Checkpoint types
+export type { Checkpoint, CheckpointPosition, CheckpointResult } from './agent/checkpoint.js'
+
 // App state
 export { StateStore } from './state-store.js'
 

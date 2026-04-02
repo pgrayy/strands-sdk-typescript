@@ -66,6 +66,7 @@ import { Tracer } from '../telemetry/tracer.js'
 import { Meter } from '../telemetry/meter.js'
 import type { AttributeValue } from '@opentelemetry/api'
 import { logger } from '../logging/logger.js'
+import type { Checkpoint, CheckpointResult } from './checkpoint.js'
 
 /**
  * Recursive type definition for nested tool arrays.
@@ -376,6 +377,205 @@ export class Agent implements LocalAgent, InvokableAgent {
       result = await gen.next()
     }
     return result.value
+  }
+
+  /**
+   * Runs one chunk of the agent loop and returns either a checkpoint or the final result.
+   *
+   * In checkpoint mode, the agent loop pauses at defined boundaries (after model calls,
+   * after tool execution) and returns control to the caller. The caller can then cache
+   * the result and call this method again with the checkpoint to resume.
+   *
+   * This enables durable execution with external orchestrators like Temporal:
+   * each call becomes a separate Activity that Temporal can cache and replay.
+   *
+   * On the first call, pass the user prompt as `args` with no checkpoint.
+   * On subsequent calls, pass the checkpoint returned by the previous call.
+   *
+   * The agent's messages and appState are mutated in place during execution,
+   * just like invoke(). The caller is responsible for persisting and restoring
+   * agent state between calls (e.g. via SessionManager).
+   *
+   * @param args - User input for the first call, or undefined when resuming
+   * @param options - Optional per-invocation options
+   * @returns CheckpointResult indicating either completion or a pause point
+   *
+   * @example
+   * ```typescript
+   * const agent = new Agent({ model, tools })
+   *
+   * // First call: start the invocation
+   * let result = await agent.invokeWithCheckpoint('What is the weather?')
+   *
+   * // Keep resuming until done
+   * while (!result.done) {
+   *   // Persist agent state here if needed (e.g. via SessionManager)
+   *   result = await agent.invokeWithCheckpoint(undefined, { checkpoint: result.checkpoint })
+   * }
+   *
+   * console.log(result.result.lastMessage)
+   * ```
+   */
+  public async invokeWithCheckpoint(
+    args?: InvokeArgs,
+    options?: InvokeOptions & { checkpoint?: Checkpoint }
+  ): Promise<CheckpointResult> {
+    using _lock = this.acquireLock()
+
+    await this.initialize()
+
+    const checkpoint = options?.checkpoint
+
+    // Resuming from afterModel checkpoint: execute tools, then return afterTools checkpoint
+    if (checkpoint?.position === 'afterModel' && checkpoint.stopReason === 'toolUse') {
+      return this._resumeAfterModel(checkpoint, options)
+    }
+
+    // Resuming from afterTools checkpoint: run the next model call
+    if (checkpoint?.position === 'afterTools') {
+      return this._runModelAndCheckpoint(checkpoint.cycleIndex + 1, options)
+    }
+
+    // Fresh invocation: append user messages, run first model call
+    if (args !== undefined) {
+      const messagesToAppend = this._normalizeInput(args)
+      for (const message of messagesToAppend) {
+        this._appendMessage(message)
+      }
+    }
+
+    return this._runModelAndCheckpoint(0, options)
+  }
+
+  /**
+   * Runs a model call and returns a checkpoint after it completes.
+   * If the model's stop reason is not 'toolUse', returns the final result instead.
+   */
+  private async _runModelAndCheckpoint(cycleIndex: number, options?: InvokeOptions): Promise<CheckpointResult> {
+    const structuredOutputSchema = options?.structuredOutputSchema ?? this._structuredOutputSchema
+    const structuredOutputTool = structuredOutputSchema ? new StructuredOutputTool(structuredOutputSchema) : undefined
+
+    try {
+      if (structuredOutputTool) {
+        this._toolRegistry.add(structuredOutputTool)
+      }
+
+      // Run model call (consume the generator to execute it)
+      const modelResult = await this._consumeModelStream()
+
+      if (modelResult.stopReason !== 'toolUse') {
+        // Model is done. Append message and return final result.
+        this._appendMessage(modelResult.message)
+
+        return {
+          done: true,
+          result: new AgentResult({
+            stopReason: modelResult.stopReason,
+            lastMessage: modelResult.message,
+          }),
+        }
+      }
+
+      // Model wants tools. Return checkpoint before executing them.
+      return {
+        done: false,
+        checkpoint: {
+          position: 'afterModel',
+          stopReason: modelResult.stopReason,
+          modelMessage: modelResult.message,
+          cycleIndex,
+        },
+      }
+    } finally {
+      if (structuredOutputTool) {
+        this._toolRegistry.remove(STRUCTURED_OUTPUT_TOOL_NAME)
+      }
+    }
+  }
+
+  /**
+   * Resumes from an afterModel checkpoint by executing tools,
+   * then returns an afterTools checkpoint.
+   */
+  private async _resumeAfterModel(checkpoint: Checkpoint, options?: InvokeOptions): Promise<CheckpointResult> {
+    const structuredOutputSchema = options?.structuredOutputSchema ?? this._structuredOutputSchema
+    const structuredOutputTool = structuredOutputSchema ? new StructuredOutputTool(structuredOutputSchema) : undefined
+
+    // Rehydrate modelMessage if it was deserialized to a plain object
+    // (e.g. after crossing Temporal's serialization boundary)
+    const modelMessage =
+      checkpoint.modelMessage instanceof Message
+        ? checkpoint.modelMessage
+        : Message.fromJSON(checkpoint.modelMessage as unknown as import('../types/messages.js').MessageData)
+
+    try {
+      if (structuredOutputTool) {
+        this._toolRegistry.add(structuredOutputTool)
+      }
+
+      // Execute tools for the model's tool use blocks
+      const toolResultMessage = await this._consumeToolStream(modelMessage, this._toolRegistry)
+
+      // Deferred append: both messages added after tool execution completes
+      this._appendMessage(modelMessage)
+      this._appendMessage(toolResultMessage)
+
+      // Check for structured output
+      if (structuredOutputTool) {
+        const structuredOutput = this._extractStructuredOutput(modelMessage, toolResultMessage)
+        if (structuredOutput !== undefined) {
+          return {
+            done: true,
+            result: new AgentResult({
+              stopReason: checkpoint.stopReason,
+              lastMessage: modelMessage,
+              structuredOutput,
+            }),
+          }
+        }
+      }
+
+      return {
+        done: false,
+        checkpoint: {
+          position: 'afterTools',
+          stopReason: checkpoint.stopReason,
+          modelMessage,
+          toolResultMessage,
+          cycleIndex: checkpoint.cycleIndex,
+        },
+      }
+    } finally {
+      if (structuredOutputTool) {
+        this._toolRegistry.remove(STRUCTURED_OUTPUT_TOOL_NAME)
+      }
+    }
+  }
+
+  /**
+   * Consumes the model stream generator and returns the aggregated result.
+   * This is a non-streaming version of _invokeModel for checkpoint mode.
+   */
+  private async _consumeModelStream(): Promise<StreamAggregatedResult> {
+    const gen = this._invokeModel()
+    let next = await gen.next()
+    while (!next.done) {
+      next = await gen.next()
+    }
+    return next.value
+  }
+
+  /**
+   * Consumes the tool execution generator and returns the tool result message.
+   * This is a non-streaming version of executeTools for checkpoint mode.
+   */
+  private async _consumeToolStream(assistantMessage: Message, toolRegistry: ToolRegistry): Promise<Message> {
+    const gen = this.executeTools(assistantMessage, toolRegistry)
+    let next = await gen.next()
+    while (!next.done) {
+      next = await gen.next()
+    }
+    return next.value
   }
 
   /**
