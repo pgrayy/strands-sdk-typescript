@@ -1,0 +1,3 @@
+[submodule "forks/wasm-deps"]
+	path = forks/wasm-deps
+	url = https://github.com/pgrayy/wasm-deps.git
