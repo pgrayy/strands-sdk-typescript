@@ -4,5 +4,5 @@ version = "0.1.0"
 description = "Demo: WASM component with async support via pgrayy-wasmtime"
 requires-python = ">=3.10"
 dependencies = [
-    "pgrayy-wasmtime==44.0.2",
+    "pgrayy-wasmtime==46.0.3",
 ]
