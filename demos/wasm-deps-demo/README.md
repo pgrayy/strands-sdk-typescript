@@ -1,20 +1,19 @@
 # wasm-deps Demo
 
-Demonstrates the wasm-deps integration: a Rust WASM component loaded by the forked wasmtime-py with async support.
+Demonstrates a Rust WASM component loaded by the forked wasmtime-py (`pgrayy-wasmtime`) with async component model support.
 
 ## Prerequisites
 
 - Rust with `wasm32-wasip2` target: `rustup target add wasm32-wasip2`
 - Python 3.10+
-- Forked wasmtime-py (from wasm-deps GitHub Release or local build)
 
 ## Setup
 
 ```bash
-# Install the forked wasmtime-py (from local wasm-deps checkout or release wheel)
-pip install -e ../../forks/wasmtime-py
-# Or from a GitHub Release:
-# pip install https://github.com/pgrayy/wasm-deps/releases/download/v0.1.0/wasmtime-...-macosx_11_0_arm64.whl
+# Create a venv and install dependencies
+python3.13 -m venv .venv
+source .venv/bin/activate
+pip install -e .
 ```
 
 ## Build the WASM component
@@ -22,6 +21,7 @@ pip install -e ../../forks/wasmtime-py
 ```bash
 cd component
 cargo build --target wasm32-wasip2 --release
+cd ..
 ```
 
 ## Run the demo
@@ -35,7 +35,5 @@ Expected output:
 ```
 greet: Hello, wasm-deps! Greetings from a WASM component.
 add:   42
-fetch: HTTP 200 | {"origin": "..."}... (XXms)
-
-All checks passed.
+Success! pgrayy-wasmtime with async component model works.
 ```
